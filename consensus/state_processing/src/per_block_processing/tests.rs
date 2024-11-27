@@ -15,6 +15,7 @@ use ssz_types::Bitfield;
 use std::sync::{Arc, LazyLock};
 use test_utils::generate_deterministic_keypairs;
 use types::*;
+use types::test_utils::generate_deterministic_keypair;
 
 pub const MAX_VALIDATOR_COUNT: usize = 97;
 pub const NUM_DEPOSITS: u64 = 1;
@@ -1140,5 +1141,129 @@ async fn block_replayer_peeking_state_roots() {
             .unwrap()
             .unwrap(),
         (dummy_state_root, dummy_slot)
+    );
+}
+
+/// Test that multiple deposits to the same validator within an epoch are handled correctly.
+/// This test verifies:
+/// 1. Deposits are not incorrectly combined
+/// 2. Validator is only added once to the registry
+/// 3. Final balance reflects all deposits
+#[tokio::test]
+async fn test_multiple_deposits_same_validator_same_epoch() {
+    let spec = MainnetEthSpec::default_spec();
+    let harness = get_harness::<MainnetEthSpec>(EPOCH_OFFSET, VALIDATOR_COUNT).await;
+
+    let keypair = generate_deterministic_keypair(1);
+    let pubkey: PublicKeyBytes = keypair.pk.clone().into();
+
+    let deposit_amount = 1_000_000_000; // 1 ETH in Gwei
+
+    // Create first deposit and get updated state
+    let mut current_state = harness.get_current_state();
+    // Get initial balance before any deposits
+    let initial_balance = if let Some(index) = current_state
+        .validators()
+        .iter()
+        .position(|v| v.pubkey == pubkey)
+    {
+        current_state.balances().get(index).copied().unwrap_or(0)
+    } else {
+        0
+    };
+
+    let (deposits1, state) = harness.make_deposits(
+        &mut current_state,
+        1,
+        Some(pubkey.clone()),
+        None,
+    );
+
+    // Process first deposit
+    let mut head_block = harness
+        .chain
+        .head_beacon_block()
+        .as_ref()
+        .clone()
+        .deconstruct()
+        .0;
+    *head_block.to_mut().body_mut().deposits_mut() = deposits1.clone().into();
+
+    let result = process_operations::process_deposits(
+        state,
+        head_block.body().deposits(),
+        &spec,
+    );
+    assert_eq!(result, Ok(()));
+
+    // Advance a few slots but stay in same epoch
+    for _ in 0..3 {
+        harness.advance_slot();
+    }
+
+    // Create second deposit for same validator
+    let (deposits2, state) = harness.make_deposits(
+        state,
+        1,
+        Some(pubkey.clone()),
+        None,
+    );
+
+    // Process second deposit
+    *head_block.to_mut().body_mut().deposits_mut() = deposits2.into();
+    let result = process_operations::process_deposits(
+        state,
+        head_block.body().deposits(),
+        &spec,
+    );
+    assert_eq!(result, Ok(()));
+
+    // Collect all validation errors
+    let mut errors = Vec::new();
+
+    // Verify final state
+    let validator_indices: Vec<_> = state
+        .validators()
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| v.pubkey == pubkey)
+        .map(|(i, _)| i)
+        .collect();
+
+    if validator_indices.len() != 1 {
+        errors.push(format!(
+            "Expected exactly one validator index, found {}",
+            validator_indices.len()
+        ));
+    }
+
+    // Continue with balance check even if we have multiple indices
+    for validator_index in &validator_indices {
+        let balance = state.balances().get(*validator_index).copied().unwrap_or(0);
+        if balance != initial_balance + (deposit_amount * 2) {
+            errors.push(format!(
+                "Validator {} balance is {} gwei, expected {} gwei (initial: {} + deposits: {})",
+                validator_index,
+                balance,
+                initial_balance + (deposit_amount * 2),
+                initial_balance,
+                deposit_amount * 2
+            ));
+        }
+
+        let validator = state.validators().get(*validator_index).unwrap();
+        if !validator.is_active_at(state.current_epoch()) {
+            errors.push(format!(
+                "Validator {} is not active at current epoch",
+                validator_index
+            ));
+        }
+    }
+
+    // Report all errors at once
+    assert!(
+        errors.is_empty(),
+        "Found the following validation errors:\n{}",
+        errors.join("\n")
     );
 }
