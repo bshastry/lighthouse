@@ -1144,15 +1144,29 @@ async fn block_replayer_peeking_state_roots() {
     );
 }
 
+#[tokio::test]
+async fn test_multiple_deposits_same_validator_same_epoch_pre_electra() {
+    test_multiple_deposits_same_validator_same_epoch_internal(false).await;
+}
+
+#[tokio::test]
+async fn test_multiple_deposits_same_validator_same_epoch_post_electra() {
+    test_multiple_deposits_same_validator_same_epoch_internal(true).await;
+}
+
 /// Test that multiple deposits to the same validator within an epoch are handled correctly.
 /// This test verifies:
 /// 1. Deposits are not incorrectly combined
 /// 2. Validator is only added once to the registry
 /// 3. Final balance reflects all deposits
-#[tokio::test]
-async fn test_multiple_deposits_same_validator_same_epoch() {
-    let spec = MainnetEthSpec::default_spec();
+async fn test_multiple_deposits_same_validator_same_epoch_internal(enable_electra: bool) {
+    let mut spec = MainnetEthSpec::default_spec();
     let harness = get_harness::<MainnetEthSpec>(EPOCH_OFFSET, VALIDATOR_COUNT).await;
+    let slots_per_epoch = MainnetEthSpec::slots_per_epoch();
+    if enable_electra {
+        spec.electra_fork_epoch = Some(Epoch::new(6));
+        harness.extend_to_slot(spec.electra_fork_epoch.unwrap().start_slot(slots_per_epoch)).await;
+    }
 
     let keypair = generate_deterministic_keypair(1);
     let pubkey: PublicKeyBytes = keypair.pk.clone().into();
