@@ -10,7 +10,7 @@ use crate::{
     per_block_processing::{process_operations, verify_exit::verify_exit},
     BlockSignatureStrategy, ConsensusContext, VerifyBlockRoot, VerifySignatures,
 };
-use beacon_chain::test_utils::{BeaconChainHarness, EphemeralHarnessType};
+use beacon_chain::test_utils::{BeaconChainHarness, EphemeralHarnessType, HARNESS_GENESIS_TIME};
 use ssz_types::Bitfield;
 use std::sync::{Arc, LazyLock};
 use test_utils::generate_deterministic_keypairs;
@@ -1161,20 +1161,51 @@ async fn test_multiple_deposits_same_validator_same_epoch_post_electra() {
 /// 3. Final balance reflects all deposits
 async fn test_multiple_deposits_same_validator_same_epoch_internal(enable_electra: bool) {
     let mut spec = MainnetEthSpec::default_spec();
-    let harness = get_harness::<MainnetEthSpec>(EPOCH_OFFSET, VALIDATOR_COUNT).await;
-    let slots_per_epoch = MainnetEthSpec::slots_per_epoch();
     if enable_electra {
+        spec.altair_fork_epoch = Some(Epoch::new(2));
+        spec.bellatrix_fork_epoch = Some(Epoch::new(3));
+        spec.capella_fork_epoch = Some(Epoch::new(4));
+        spec.deneb_fork_epoch = Some(Epoch::new(5));
         spec.electra_fork_epoch = Some(Epoch::new(6));
+    }
+    let slots_per_epoch = MainnetEthSpec::slots_per_epoch();
+    let spec = Arc::new(spec);
+    let harness = BeaconChainHarness::builder(MainnetEthSpec)
+        .spec(spec.clone())
+        .deterministic_keypairs(VALIDATOR_COUNT)
+        .mock_execution_layer()
+        .mock_execution_layer_all_payloads_valid()
+        .recalculate_fork_times_with_genesis(HARNESS_GENESIS_TIME)
+        .fresh_ephemeral_store()
+        .build();
+
+    if enable_electra {
         harness.extend_to_slot(spec.electra_fork_epoch.unwrap().start_slot(slots_per_epoch)).await;
     }
 
     let keypair = generate_deterministic_keypair(1);
     let pubkey: PublicKeyBytes = keypair.pk.clone().into();
 
+    // make_deposits uses spec.min_deposit_amount as the deposit amount
+    // spec.min_deposit_amount is 1 ETH for mainnet
     let deposit_amount = 1_000_000_000; // 1 ETH in Gwei
 
     // Create first deposit and get updated state
     let mut current_state = harness.get_current_state();
+    // debug
+    println!(
+        "Fork state: {:?}, Electra enabled: {}",
+        current_state.fork(),
+        current_state.fork_name_unchecked().electra_enabled(),
+    );
+
+    println!(
+        "Test setup: Electra fork epoch: {:?}, Current slot: {}",
+        spec.electra_fork_epoch,
+        current_state.slot(),
+    );
+
+
     // Get initial balance before any deposits
     let initial_balance = if let Some(index) = current_state
         .validators()
