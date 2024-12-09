@@ -531,6 +531,8 @@ impl<E: EthSpec> ForkVersionDeserialize for Vec<Attestation<E>> {
 mod tests {
     use super::*;
     use crate::*;
+    // Specify the type parameter
+    type E = MainnetEthSpec;
 
     // Check the in-memory size of an `Attestation`, which is useful for reasoning about memory
     // and preventing regressions.
@@ -589,5 +591,273 @@ mod tests {
     mod electra {
         use super::*;
         ssz_and_tree_hash_tests!(AttestationElectra<MainnetEthSpec>);
+    }
+
+    fn create_test_data() -> AttestationData {
+        AttestationData {
+            slot: Slot::new(1),
+            index: 0,
+            beacon_block_root: Hash256::zero(),
+            source: Checkpoint {
+                epoch: Epoch::new(0),
+                root: Hash256::zero(),
+            },
+            target: Checkpoint {
+                epoch: Epoch::new(1),
+                root: Hash256::zero(),
+            },
+        }
+    }
+
+    #[test]
+    fn test_creation_equivalence() {
+        let data = create_test_data();
+
+        // Use fully-qualified syntax for associated types
+        let committee_length = <MainnetEthSpec as EthSpec>::MaxValidatorsPerCommittee::to_usize();
+        let validators_per_slot = <MainnetEthSpec as EthSpec>::MaxValidatorsPerSlot::to_usize();
+
+        // Create Base attestation - validator 0 in committee 0 voting
+        let mut base_bits = BitList::with_capacity(committee_length).unwrap();
+        // Set bit for validator at index 0
+        base_bits.set(0, true).unwrap();
+        let base = Attestation::Base(AttestationBase::<E> {
+            aggregation_bits: base_bits,
+            data: data.clone(),
+            signature: AggregateSignature::infinity(),
+        });
+
+        // Create Electra attestation - can track all committees
+        let mut committee_bits = BitVector::<<MainnetEthSpec as EthSpec>::MaxCommitteesPerSlot>::new();
+        committee_bits.set(0, true).unwrap();
+
+        let mut electra_bits = BitList::with_capacity(validators_per_slot).unwrap();
+        // Set bit for validator at index 0 overall
+        electra_bits.set(0, true).unwrap();
+
+        let electra = Attestation::Electra(AttestationElectra::<E> {
+            aggregation_bits: electra_bits,
+            data: data.clone(),
+            signature: AggregateSignature::infinity(),
+            committee_bits,
+        });
+
+        // Verify basic properties are equivalent
+        assert_eq!(base.data(), electra.data());
+        assert_eq!(base.is_aggregation_bits_zero(), false);
+        assert_eq!(base.is_aggregation_bits_zero(), electra.is_aggregation_bits_zero());
+        assert_eq!(base.num_set_aggregation_bits(), 1);
+        assert_eq!(base.num_set_aggregation_bits(), electra.num_set_aggregation_bits());
+        assert_eq!(base.committee_index(), Some(0));
+        assert_eq!(base.committee_index(), electra.committee_index());
+    }
+
+    #[test]
+    fn test_signature_equivalence() {
+        let data = create_test_data();
+        let committee_position = 0;
+        let secret_key = SecretKey::random();
+        let fork = Fork::default();
+        let genesis_validators_root = Hash256::zero();
+        let spec = ChainSpec::mainnet();
+
+        // Use fully-qualified syntax for associated types
+        let committee_length = <MainnetEthSpec as EthSpec>::MaxValidatorsPerCommittee::to_usize();
+        let validators_per_slot = <MainnetEthSpec as EthSpec>::MaxValidatorsPerSlot::to_usize();
+
+        // Create Base attestation - validator 0 in committee 0 voting
+        let base_bits = BitList::with_capacity(committee_length).unwrap();
+
+        // Create and sign Base attestation
+        let mut base = Attestation::Base(AttestationBase::<E> {
+            aggregation_bits: base_bits,
+            data: data.clone(),
+            signature: AggregateSignature::infinity(),
+        });
+        base.sign(&secret_key, committee_position, &fork, genesis_validators_root, &spec)
+            .unwrap();
+
+        // Create and sign Electra attestation
+        let mut committee_bits = BitVector::default();
+        committee_bits.set(0, true).unwrap();
+
+        let electra_bits = BitList::with_capacity(validators_per_slot).unwrap();
+
+        let mut electra = Attestation::Electra(AttestationElectra::<E> {
+            aggregation_bits: electra_bits,
+            data: data.clone(),
+            signature: AggregateSignature::infinity(),
+            committee_bits,
+        });
+        electra.sign(&secret_key, committee_position, &fork, genesis_validators_root, &spec)
+            .unwrap();
+
+        // Verify signatures are equivalent
+        assert_eq!(base.signature(), electra.signature());
+        assert_eq!(base.is_aggregation_bits_zero(), false);
+        assert_eq!(base.is_aggregation_bits_zero(), electra.is_aggregation_bits_zero());
+        assert_eq!(base.num_set_aggregation_bits(), 1);
+        assert_eq!(base.num_set_aggregation_bits(), electra.num_set_aggregation_bits());
+        assert_eq!(base.committee_index(), Some(0));
+        assert_eq!(base.committee_index(), electra.committee_index());
+    }
+
+    #[test]
+    fn test_aggregation_equivalence() {
+        let data = create_test_data();
+        // Use fully-qualified syntax for associated types
+        let committee_length = <MainnetEthSpec as EthSpec>::MaxValidatorsPerCommittee::to_usize();
+        let validators_per_slot = <MainnetEthSpec as EthSpec>::MaxValidatorsPerSlot::to_usize();
+
+        // Create two Base attestations with different bits set
+        let mut base1 = Attestation::Base(AttestationBase::<E> {
+            aggregation_bits: BitList::with_capacity(committee_length).unwrap(),
+            data: data.clone(),
+            signature: AggregateSignature::infinity(),
+        });
+        base1.add_signature(&Signature::empty(), 0).unwrap();
+
+        let mut base2 = base1.clone();
+        base2.add_signature(&Signature::empty(), 1).unwrap();
+
+        // Create equivalent Electra attestations
+        let mut electra1 = Attestation::Electra(AttestationElectra::<E> {
+            aggregation_bits: BitList::with_capacity(validators_per_slot).unwrap(),
+            data: data.clone(),
+            signature: AggregateSignature::infinity(),
+            committee_bits: BitVector::default(),
+        });
+        electra1.add_signature(&Signature::empty(), 0).unwrap();
+
+        let mut electra2 = Attestation::Electra(AttestationElectra::<E> {
+            aggregation_bits: BitList::with_capacity(validators_per_slot).unwrap(),
+            data: data.clone(),
+            signature: AggregateSignature::infinity(),
+            committee_bits: BitVector::default(),
+        });
+        electra2.add_signature(&Signature::empty(), 1).unwrap();
+
+        // Aggregate both pairs
+        let mut base_agg = base1.clone();
+        base_agg.aggregate((&base2).into());
+
+        let mut electra_agg = electra1.clone();
+        electra_agg.aggregate((&electra2).into());
+
+        // Verify aggregation results are equivalent
+        assert_eq!(base_agg.is_aggregation_bits_zero(), false);
+        assert_eq!(base_agg.is_aggregation_bits_zero(), electra_agg.is_aggregation_bits_zero());
+        assert_eq!(base_agg.num_set_aggregation_bits(), 2);
+        assert_eq!(base_agg.num_set_aggregation_bits(), electra_agg.num_set_aggregation_bits());
+        assert_eq!(base_agg.signature(), electra_agg.signature());
+        let base_agg_ref: AttestationRef<'_, E> = (&base_agg).into();
+        let electra_agg_ref: AttestationRef<'_, E> = (&electra_agg).into();
+        assert_eq!(base_agg_ref.set_aggregation_bits(), vec![0, 1]);
+        assert_eq!(base_agg_ref.set_aggregation_bits(), electra_agg_ref.set_aggregation_bits());
+    }
+
+    #[test]
+    fn test_error_handling_equivalence() {
+        use super::Error as AttestationError;
+        let data = create_test_data();
+        let committee_length = <MainnetEthSpec as EthSpec>::MaxValidatorsPerCommittee::to_usize();
+        let validators_per_slot = <MainnetEthSpec as EthSpec>::MaxValidatorsPerSlot::to_usize();
+
+        // Test double signing same position
+        let mut base = Attestation::Base(AttestationBase::<E> {
+            aggregation_bits: BitList::with_capacity(committee_length).unwrap(),
+            data: data.clone(),
+            signature: AggregateSignature::infinity(),
+        });
+        base.add_signature(&Signature::empty(), 0).unwrap();
+        let base_err = base.add_signature(&Signature::empty(), 0);
+
+        let mut committee_bits = BitVector::default();
+        committee_bits.set(0, true).unwrap();
+        let mut electra = Attestation::Electra(AttestationElectra::<E> {
+            aggregation_bits: BitList::with_capacity(validators_per_slot).unwrap(),
+            data: data.clone(),
+            signature: AggregateSignature::infinity(),
+            committee_bits,
+        });
+        electra.add_signature(&Signature::empty(), 0).unwrap();
+        let electra_err = electra.add_signature(&Signature::empty(), 0);
+
+        // Verify both variants handle errors the same way
+        assert!(matches!(base_err, Err(AttestationError::AlreadySigned(0))));
+        assert!(matches!(electra_err, Err(AttestationError::AlreadySigned(0))));
+    }
+
+    #[test]
+    fn test_multi_committee_aggregation() {
+        let data = create_test_data();
+        let secret_key = SecretKey::random();
+        let fork = Fork::default();
+        let genesis_validators_root = Hash256::zero();
+        let spec = ChainSpec::mainnet();
+
+        // Committee sizes
+        let committee_length = <MainnetEthSpec as EthSpec>::MaxValidatorsPerCommittee::to_usize();
+        let validators_per_slot = <MainnetEthSpec as EthSpec>::MaxValidatorsPerSlot::to_usize();
+
+        // Base attestations - need one per committee
+        let mut base1 = Attestation::Base(AttestationBase::<E> {
+            aggregation_bits: BitList::with_capacity(committee_length).unwrap(),
+            data: AttestationData {
+                index: 0,  // Committee 0
+                ..data.clone()
+            },
+            signature: AggregateSignature::infinity(),
+        });
+
+        let mut base2 = Attestation::Base(AttestationBase::<E> {
+            aggregation_bits: BitList::with_capacity(committee_length).unwrap(),
+            data: AttestationData {
+                index: 1,  // Committee 1
+                ..data.clone()
+            },
+            signature: AggregateSignature::infinity(),
+        });
+
+        // Electra attestation - can handle multiple committees
+        let mut committee_bits = BitVector::default();
+        committee_bits.set(0, true).unwrap();  // Committee 0
+        committee_bits.set(1, true).unwrap();  // Committee 1
+
+        let mut electra = Attestation::Electra(AttestationElectra::<E> {
+            aggregation_bits: BitList::with_capacity(validators_per_slot).unwrap(),
+            data: data.clone(),
+            signature: AggregateSignature::infinity(),
+            committee_bits,
+        });
+
+        // Sign with validator 0 in committee 0
+        base1.sign(&secret_key, 0, &fork, genesis_validators_root, &spec).unwrap();
+
+        // Sign with validator 0 in committee 1
+        base2.sign(&secret_key, 1, &fork, genesis_validators_root, &spec).unwrap();
+
+        // For Electra, we need to sign with both validators
+        // This is where we might see issues with index translation
+        electra.sign(&secret_key, 0, &fork, genesis_validators_root, &spec).unwrap();  // Committee 0, validator 0
+        electra.sign(&secret_key, 1, &fork, genesis_validators_root, &spec).unwrap();  // Committee 1, validator 0
+
+        // Verify committee indices
+        assert_eq!(base1.committee_index(), Some(0));
+        assert_eq!(base2.committee_index(), Some(1));
+
+        // For Electra, get_committee_indices should return both committees
+        assert_eq!(
+            electra.as_electra().unwrap().get_committee_indices(),
+            vec![0, 1]
+        );
+
+        // Check aggregation bits are set correctly
+        assert!(base1.get_aggregation_bit(0).unwrap());
+        assert!(base2.get_aggregation_bit(1).unwrap());
+
+        // For Electra, both bits should be set at their respective committee offsets
+        assert!(electra.get_aggregation_bit(0).unwrap());  // Committee 0, validator 0
+        assert!(electra.get_aggregation_bit(1).unwrap());  // Committee 1, validator 0
     }
 }
