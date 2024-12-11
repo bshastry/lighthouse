@@ -5,6 +5,10 @@ use crate::per_block_processing::errors::{
     DepositInvalid, HeaderInvalid, IndexedAttestationInvalid, IntoWithIndex,
     ProposerSlashingInvalid,
 };
+use crate::upgrade::{
+    upgrade_to_altair, upgrade_to_bellatrix, upgrade_to_capella, upgrade_to_deneb,
+    upgrade_to_electra,
+};
 use crate::{per_block_processing, BlockReplayError, BlockReplayer};
 use crate::{
     per_block_processing::{process_operations, verify_exit::verify_exit},
@@ -1140,5 +1144,76 @@ async fn block_replayer_peeking_state_roots() {
             .unwrap()
             .unwrap(),
         (dummy_state_root, dummy_slot)
+    );
+}
+
+#[tokio::test]
+async fn test_deposit_mechanism_transition() {
+    let mut spec = MainnetEthSpec::default_spec();
+    // Set all fork epochs after EPOCH_OFFSET (4)
+    spec.altair_fork_epoch = Some(Epoch::new(5));
+    spec.bellatrix_fork_epoch = Some(Epoch::new(6));
+    spec.capella_fork_epoch = Some(Epoch::new(7));
+    spec.deneb_fork_epoch = Some(Epoch::new(8));
+    spec.electra_fork_epoch = Some(Epoch::new(9));
+
+    let harness = get_harness::<MainnetEthSpec>(EPOCH_OFFSET, VALIDATOR_COUNT).await;
+    let mut state = harness.get_current_state();
+
+    // 1. Process deposits with old mechanism
+    let (old_deposits, mut state) = harness.make_deposits(&mut state, 2, None, None);
+    let mut head_block = harness
+        .chain
+        .head_beacon_block()
+        .as_ref()
+        .clone()
+        .deconstruct()
+        .0;
+    *head_block.to_mut().body_mut().deposits_mut() = VariableList::from(old_deposits.clone());
+
+    let result =
+        process_operations::process_deposits(&mut state, head_block.body().deposits(), &spec);
+
+    assert_eq!(result, Ok(()));
+
+    // 2. Upgrade through all forks in sequence
+    upgrade_to_altair(&mut state, &spec).expect("upgrade to altair");
+    upgrade_to_bellatrix(&mut state, &spec).expect("upgrade to bellatrix");
+    upgrade_to_capella(&mut state, &spec).expect("upgrade to capella");
+    upgrade_to_deneb(&mut state, &spec).expect("upgrade to deneb");
+    upgrade_to_electra(&mut state, &spec).expect("upgrade to electra");
+
+    // 3. Test initial state
+    assert_eq!(
+        state.deposit_requests_start_index().unwrap(),
+        spec.unset_deposit_requests_start_index
+    );
+
+    // 4. Test transition to new mechanism
+    let deposit_requests = vec![DepositRequest {
+        pubkey: PublicKeyBytes::empty(),
+        withdrawal_credentials: Hash256::zero(),
+        amount: 32_000_000_000,
+        signature: Signature::empty(),
+        index: state.eth1_deposit_index(),
+    }];
+
+    let result = process_operations::process_deposit_requests(&mut state, &deposit_requests, &spec);
+    assert_eq!(result, Ok(()));
+
+    // 5. Verify deposit_requests_start_index is set correctly
+    assert_eq!(
+        state.deposit_requests_start_index().unwrap(),
+        deposit_requests[0].index
+    );
+
+    // 6. Test old mechanism is disabled
+    let result = process_operations::process_deposits(&mut state, &old_deposits, &spec);
+    assert_eq!(
+        result,
+        Err(BlockProcessingError::DepositCountInvalid {
+            expected: 0,
+            found: old_deposits.len()
+        })
     );
 }
