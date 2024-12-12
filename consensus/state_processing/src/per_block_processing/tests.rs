@@ -5,17 +5,21 @@ use crate::per_block_processing::errors::{
     DepositInvalid, HeaderInvalid, IndexedAttestationInvalid, IntoWithIndex,
     ProposerSlashingInvalid,
 };
+use crate::upgrade::{
+    upgrade_to_altair, upgrade_to_bellatrix, upgrade_to_capella, upgrade_to_deneb,
+    upgrade_to_electra,
+};
 use crate::{per_block_processing, BlockReplayError, BlockReplayer};
 use crate::{
     per_block_processing::{process_operations, verify_exit::verify_exit},
     BlockSignatureStrategy, ConsensusContext, VerifyBlockRoot, VerifySignatures,
 };
-use beacon_chain::test_utils::{BeaconChainHarness, EphemeralHarnessType, HARNESS_GENESIS_TIME};
+use beacon_chain::test_utils::{BeaconChainHarness, EphemeralHarnessType};
 use ssz_types::Bitfield;
 use std::sync::{Arc, LazyLock};
 use test_utils::generate_deterministic_keypairs;
-use types::*;
 use types::test_utils::generate_deterministic_keypair;
+use types::*;
 
 pub const MAX_VALIDATOR_COUNT: usize = 97;
 pub const NUM_DEPOSITS: u64 = 1;
@@ -1160,27 +1164,25 @@ async fn test_multiple_deposits_same_validator_same_epoch_post_electra() {
 /// 2. Validator is only added once to the registry
 /// 3. Final balance reflects all deposits
 async fn test_multiple_deposits_same_validator_same_epoch_internal(enable_electra: bool) {
+    use safe_arith::SafeArith;
     let mut spec = MainnetEthSpec::default_spec();
     if enable_electra {
-        spec.altair_fork_epoch = Some(Epoch::new(2));
-        spec.bellatrix_fork_epoch = Some(Epoch::new(3));
-        spec.capella_fork_epoch = Some(Epoch::new(4));
-        spec.deneb_fork_epoch = Some(Epoch::new(5));
-        spec.electra_fork_epoch = Some(Epoch::new(6));
+        spec.altair_fork_epoch = Some(Epoch::new(5));
+        spec.bellatrix_fork_epoch = Some(Epoch::new(6));
+        spec.capella_fork_epoch = Some(Epoch::new(7));
+        spec.deneb_fork_epoch = Some(Epoch::new(8));
+        spec.electra_fork_epoch = Some(Epoch::new(9));
     }
-    let slots_per_epoch = MainnetEthSpec::slots_per_epoch();
-    let spec = Arc::new(spec);
-    let harness = BeaconChainHarness::builder(MainnetEthSpec)
-        .spec(spec.clone())
-        .deterministic_keypairs(VALIDATOR_COUNT)
-        .mock_execution_layer()
-        .mock_execution_layer_all_payloads_valid()
-        .recalculate_fork_times_with_genesis(HARNESS_GENESIS_TIME)
-        .fresh_ephemeral_store()
-        .build();
+
+    let harness = get_harness::<MainnetEthSpec>(EPOCH_OFFSET, VALIDATOR_COUNT).await;
+    let mut state = harness.get_current_state();
 
     if enable_electra {
-        harness.extend_to_slot(spec.electra_fork_epoch.unwrap().start_slot(slots_per_epoch)).await;
+        upgrade_to_altair(&mut state, &spec).expect("upgrade to altair");
+        upgrade_to_bellatrix(&mut state, &spec).expect("upgrade to bellatrix");
+        upgrade_to_capella(&mut state, &spec).expect("upgrade to capella");
+        upgrade_to_deneb(&mut state, &spec).expect("upgrade to deneb");
+        upgrade_to_electra(&mut state, &spec).expect("upgrade to electra");
     }
 
     let keypair = generate_deterministic_keypair(1);
@@ -1190,78 +1192,89 @@ async fn test_multiple_deposits_same_validator_same_epoch_internal(enable_electr
     // spec.min_deposit_amount is 1 ETH for mainnet
     let deposit_amount = 1_000_000_000; // 1 ETH in Gwei
 
-    // Create first deposit and get updated state
-    let mut current_state = harness.get_current_state();
     // debug
     println!(
         "Fork state: {:?}, Electra enabled: {}",
-        current_state.fork(),
-        current_state.fork_name_unchecked().electra_enabled(),
+        state.fork(),
+        state.fork_name_unchecked().electra_enabled(),
     );
 
     println!(
         "Test setup: Electra fork epoch: {:?}, Current slot: {}",
         spec.electra_fork_epoch,
-        current_state.slot(),
+        state.slot(),
     );
-
 
     // Get initial balance before any deposits
-    let initial_balance = if let Some(index) = current_state
-        .validators()
-        .iter()
-        .position(|v| v.pubkey == pubkey)
-    {
-        current_state.balances().get(index).copied().unwrap_or(0)
+    let initial_balance =
+        if let Some(index) = state.validators().iter().position(|v| v.pubkey == pubkey) {
+            state.balances().get(index).copied().unwrap_or(0)
+        } else {
+            0
+        };
+
+    if enable_electra {
+        // Create deposit request
+        let deposit_requests = vec![DepositRequest {
+            pubkey: pubkey.clone(),
+            withdrawal_credentials: Hash256::zero(),
+            amount: deposit_amount,
+            signature: Signature::empty(),
+            index: state.eth1_deposit_index().safe_add(1).unwrap(),
+        }];
+
+        let result =
+            process_operations::process_deposit_requests(&mut state, &deposit_requests, &spec);
+        assert_eq!(result, Ok(()));
+
+        // Advance a few slots but stay in same epoch
+        for _ in 0..3 {
+            harness.advance_slot();
+        }
+
+        // Create second deposit request
+        let deposit_requests = vec![DepositRequest {
+            pubkey: pubkey.clone(),
+            withdrawal_credentials: Hash256::zero(),
+            amount: deposit_amount,
+            signature: Signature::empty(),
+            index: state.eth1_deposit_index().safe_add(1).unwrap(),
+        }];
+
+        let result =
+            process_operations::process_deposit_requests(&mut state, &deposit_requests, &spec);
+        assert_eq!(result, Ok(()));
     } else {
-        0
-    };
+        let (deposits1, state) = harness.make_deposits(&mut state, 1, Some(pubkey.clone()), None);
 
-    let (deposits1, state) = harness.make_deposits(
-        &mut current_state,
-        1,
-        Some(pubkey.clone()),
-        None,
-    );
+        // Process first deposit
+        let mut head_block = harness
+            .chain
+            .head_beacon_block()
+            .as_ref()
+            .clone()
+            .deconstruct()
+            .0;
+        *head_block.to_mut().body_mut().deposits_mut() = deposits1.clone().into();
 
-    // Process first deposit
-    let mut head_block = harness
-        .chain
-        .head_beacon_block()
-        .as_ref()
-        .clone()
-        .deconstruct()
-        .0;
-    *head_block.to_mut().body_mut().deposits_mut() = deposits1.clone().into();
+        let result =
+            process_operations::process_deposits(state, head_block.body().deposits(), &spec);
+        assert_eq!(result, Ok(()));
 
-    let result = process_operations::process_deposits(
-        state,
-        head_block.body().deposits(),
-        &spec,
-    );
-    assert_eq!(result, Ok(()));
+        // Advance a few slots but stay in same epoch
+        for _ in 0..3 {
+            harness.advance_slot();
+        }
 
-    // Advance a few slots but stay in same epoch
-    for _ in 0..3 {
-        harness.advance_slot();
+        // Create second deposit for same validator
+        let (deposits2, state) = harness.make_deposits(state, 1, Some(pubkey.clone()), None);
+
+        // Process second deposit
+        *head_block.to_mut().body_mut().deposits_mut() = deposits2.into();
+        let result =
+            process_operations::process_deposits(state, head_block.body().deposits(), &spec);
+        assert_eq!(result, Ok(()));
     }
-
-    // Create second deposit for same validator
-    let (deposits2, state) = harness.make_deposits(
-        state,
-        1,
-        Some(pubkey.clone()),
-        None,
-    );
-
-    // Process second deposit
-    *head_block.to_mut().body_mut().deposits_mut() = deposits2.into();
-    let result = process_operations::process_deposits(
-        state,
-        head_block.body().deposits(),
-        &spec,
-    );
-    assert_eq!(result, Ok(()));
 
     // Collect all validation errors
     let mut errors = Vec::new();
