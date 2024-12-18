@@ -333,6 +333,7 @@ pub fn is_compounding_withdrawal_credential(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::generate_deterministic_keypair;
 
     #[test]
     fn default() {
@@ -389,4 +390,79 @@ mod tests {
     }
 
     ssz_and_tree_hash_tests!(Validator);
+
+    #[test]
+    fn test_partial_withdrawals_electra() {
+        let keypair = generate_deterministic_keypair(0);
+        let spec = ChainSpec::default();
+
+        // Case 1: Electra compounding, 2048 ETH effective balance with excess
+        let mut withdrawal_credentials = vec![0; 32];
+        withdrawal_credentials[0] = 0x02;
+        let withdrawal_credentials = Hash256::from_slice(&withdrawal_credentials);
+        let mut validator = Validator {
+            pubkey: keypair.pk.into(),
+            withdrawal_credentials,
+            effective_balance: 2048 * 10_u64.pow(9), // 2048 ETH
+            slashed: false,
+            activation_eligibility_epoch: Epoch::new(0),
+            activation_epoch: Epoch::new(0),
+            exit_epoch: Epoch::new(u64::MAX),
+            withdrawable_epoch: Epoch::new(0),
+        };
+
+        let balance = 204825 * 10_u64.pow(7); // 2048.25 ETH
+        assert!(
+            validator.is_partially_withdrawable_validator_electra(
+                balance,
+                &spec,
+                ForkName::Electra
+            ),
+            "Compounding validator with 2048 ETH effective balance should allow withdrawal"
+        );
+
+        // Case 2: Electra non-compounding, 2048 ETH effective balance
+        let mut withdrawal_credentials = vec![0; 32];
+        withdrawal_credentials[0] = 0x01;
+        let withdrawal_credentials = Hash256::from_slice(&withdrawal_credentials);
+        validator.withdrawal_credentials = withdrawal_credentials;
+        assert!(
+            !validator.is_partially_withdrawable_validator_electra(
+                balance,
+                &spec,
+                ForkName::Electra
+            ),
+            "Non-compounding validator should not allow withdrawal"
+        );
+
+        // Case 3: Electra compounding, 32 ETH effective balance
+        let mut withdrawal_credentials = vec![0; 32];
+        withdrawal_credentials[0] = 0x02;
+        let withdrawal_credentials = Hash256::from_slice(&withdrawal_credentials);
+        validator.withdrawal_credentials = withdrawal_credentials;
+        validator.effective_balance = 32 * 10_u64.pow(9); // 32 ETH
+        let balance = 3225 * 10_u64.pow(7); // 32.25 ETH
+        assert!(
+            !validator.is_partially_withdrawable_validator_electra(
+                balance,
+                &spec,
+                ForkName::Electra
+            ),
+            "Compounding validator with 32 ETH effective balance should not allow withdrawal"
+        );
+
+        // Case 4: Electra non-compounding, 32 ETH effective balance
+        let mut withdrawal_credentials = vec![0; 32];
+        withdrawal_credentials[0] = 0x01;
+        let withdrawal_credentials = Hash256::from_slice(&withdrawal_credentials);
+        validator.withdrawal_credentials = withdrawal_credentials;
+        assert!(
+            validator.is_partially_withdrawable_validator_electra(
+                balance,
+                &spec,
+                ForkName::Electra
+            ),
+            "Non-compounding validator with 32 ETH effective balance should allow withdrawal"
+        );
+    }
 }
